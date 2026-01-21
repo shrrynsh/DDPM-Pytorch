@@ -1,3 +1,12 @@
+
+import sys
+import os
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")
+)
+sys.path.append(PROJECT_ROOT)
+
 import torch
 import yaml
 import argparse
@@ -16,6 +25,7 @@ import json
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
 
 
 def train(rank, world_size, args):
