@@ -7,88 +7,204 @@ from tqdm import tqdm
 from torch.optim import Adam
 from dataset.mnist_dataset import MnistDataset
 from torch.utils.data import DataLoader
+from torch.utils.data import DistributedSampler
+from collections import defaultdict
 from models.unet_base import Unet
 from scheduler.linear_noise_scheduler import LinearNoiseScheduler
+from scheduler.cosine_noise_scheduler import CosineNoiseScheduler
+import json
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 
-def train(args):
-    # Read the config file #
+def train(rank, world_size, args):
+    # -------------------- DDP INIT --------------------
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+    )
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    # -------------------- CONFIG --------------------
     with open(args.config_path, 'r') as file:
-        try:
-            config = yaml.safe_load(file)
-        except yaml.YAMLError as exc:
-            print(exc)
-    print(config)
-    ########################
-    
+        config = yaml.safe_load(file)
+
     diffusion_config = config['diffusion_params']
     dataset_config = config['dataset_params']
     model_config = config['model_params']
     train_config = config['train_params']
-    
-    # Create the noise scheduler
-    scheduler = LinearNoiseScheduler(num_timesteps=diffusion_config['num_timesteps'],
-                                     beta_start=diffusion_config['beta_start'],
-                                     beta_end=diffusion_config['beta_end'])
-    
-    # Create the dataset
+
+    # -------------------- SCHEDULER --------------------
+    scheduler = CosineNoiseScheduler(
+        num_timesteps=diffusion_config['num_timesteps']
+    )
+
+    # -------------------- DATASET --------------------
     mnist = MnistDataset('train', im_path=dataset_config['im_path'])
-    mnist_loader = DataLoader(mnist, batch_size=train_config['batch_size'], shuffle=True, num_workers=4)
-    
-    # Instantiate the model
+
+    sampler = DistributedSampler(
+        mnist,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True
+    )
+
+    mnist_loader = DataLoader(
+        mnist,
+        batch_size=train_config['batch_size'],
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    # -------------------- MODEL --------------------
     model = Unet(model_config).to(device)
     model.train()
-    
-    # Create output directories
-    if not os.path.exists(train_config['task_name']):
+
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[rank]
+    )
+
+    # -------------------- OUTPUT DIR --------------------
+    if rank == 0 and not os.path.exists(train_config['task_name']):
         os.mkdir(train_config['task_name'])
-    
-    # Load checkpoint if found
-    if os.path.exists(os.path.join(train_config['task_name'],train_config['ckpt_name'])):
-        print('Loading checkpoint as found one')
-        model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
-                                                      train_config['ckpt_name']), map_location=device))
-    # Specify training parameters
-    num_epochs = train_config['num_epochs']
+
+    # -------------------- CHECKPOINT --------------------
+    ckpt_path = os.path.join(
+        train_config['task_name'],
+        train_config['ckpt_name']
+    )
+
+    if os.path.exists(ckpt_path):
+        if rank == 0:
+            print("Loading checkpoint")
+        map_location = {'cuda:0': f'cuda:{rank}'}
+        model.module.load_state_dict(
+            torch.load(ckpt_path, map_location=map_location)
+        )
+
+    # -------------------- OPTIM --------------------
     optimizer = Adam(model.parameters(), lr=train_config['lr'])
     criterion = torch.nn.MSELoss()
-    
-    # Run training
+
+    num_epochs = train_config['num_epochs']
+    training_logs = []
+
+    # -------------------- TRAIN LOOP --------------------
     for epoch_idx in range(num_epochs):
+        sampler.set_epoch(epoch_idx)
+
         losses = []
-        for im in tqdm(mnist_loader):
+        timestep_losses = defaultdict(list)
+        timestep_gradients = defaultdict(list)
+
+        for im in tqdm(mnist_loader, disable=(rank != 0)):
             optimizer.zero_grad()
+
             im = im.float().to(device)
-            
-            # Sample random noise
-            noise = torch.randn_like(im).to(device)
-            
-            # Sample timestep
-            t = torch.randint(0, diffusion_config['num_timesteps'], (im.shape[0],)).to(device)
-            
-            # Add noise to images according to timestep
+            noise = torch.randn_like(im)
+
+            t = torch.randint(
+                0,
+                diffusion_config['num_timesteps'],
+                (im.shape[0],),
+                device=device
+            )
+
             noisy_im = scheduler.add_noise(im, noise, t)
             noise_pred = model(noisy_im, t)
 
             loss = criterion(noise_pred, noise)
             losses.append(loss.item())
-            loss.backward()
-            optimizer.step()
-        print('Finished epoch:{} | Loss : {:.4f}'.format(
-            epoch_idx + 1,
-            np.mean(losses),
-        ))
-        torch.save(model.state_dict(), os.path.join(train_config['task_name'],
-                                                    train_config['ckpt_name']))
-    
-    print('Done Training ...')
-    
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Arguments for ddpm training')
-    parser.add_argument('--config', dest='config_path',
-                        default='config/default.yaml', type=str)
+            # ----- per-timestep loss -----
+            with torch.no_grad():
+                for i, ts in enumerate(t.tolist()):
+                    l = criterion(
+                        noise_pred[i:i+1],
+                        noise[i:i+1]
+                    ).item()
+                    timestep_losses[int(ts)].append(l)
+
+            loss.backward()
+
+            # ----- gradient norm -----
+            total_grad_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    total_grad_norm += p.grad.data.norm(2).item() ** 2
+            total_grad_norm = total_grad_norm ** 0.5
+
+            for ts in t.tolist():
+                timestep_gradients[int(ts)].append(total_grad_norm)
+
+            optimizer.step()
+
+        # -------------------- LOGGING (rank 0 only) --------------------
+        if rank == 0:
+            epoch_log = {
+                'epoch': epoch_idx + 1,
+                'overall_loss': float(np.mean(losses)),
+                'timestep_data': {}
+            }
+
+            for ts in timestep_losses:
+                epoch_log['timestep_data'][ts] = {
+                    'losses': timestep_losses[ts],
+                    'gradients': timestep_gradients[ts],
+                    'mean_loss': float(np.mean(timestep_losses[ts])),
+                    'mean_gradient': float(np.mean(timestep_gradients[ts]))
+                }
+
+            training_logs.append(epoch_log)
+
+            print(
+                f"Epoch [{epoch_idx+1}/{num_epochs}] "
+                f"Loss: {np.mean(losses):.4f}"
+            )
+
+            torch.save(
+                model.module.state_dict(),
+                ckpt_path
+            )
+
+    # -------------------- SAVE LOGS --------------------
+    if rank == 0:
+        log_path = os.path.join(
+            train_config['task_name'],
+            'training_logs_cosine.json'
+        )
+        with open(log_path, 'w') as f:
+            json.dump(training_logs, f, indent=2)
+
+        print("Training complete")
+        print(f"Logs saved to {log_path}")
+
+    dist.destroy_process_group()
+
+
+# -------------------- MAIN --------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DDPM Training (DDP)")
+    parser.add_argument(
+        '--config',
+        dest='config_path',
+        default='config/default.yaml',
+        type=str
+    )
     args = parser.parse_args()
-    train(args)
+
+    world_size = torch.cuda.device_count()  # should be 2 on Kaggle
+
+    mp.spawn(
+        train,
+        args=(world_size, args),
+        nprocs=world_size,
+        join=True
+    )
