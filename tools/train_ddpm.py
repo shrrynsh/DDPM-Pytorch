@@ -5,7 +5,7 @@ import os
 PROJECT_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..")
 )
-sys.path.append(PROJECT_ROOT)
+sys.path.append('/kaggle/working/DDPM-Pytorch')
 
 import torch
 import yaml
